@@ -10,12 +10,19 @@ from telegram.ext import (
 import logging
 from config import TOKEN, TIMEZONE
 from tarot_cards import tarot_deck
-import random
+from database import init_db, get_user, update_user
 from pytz import timezone
+import random
+import sqlite3
 
-# Настройка логирования
+# Инициализация БД
+init_db()
+
+# Логирование
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
@@ -26,143 +33,82 @@ SPREADS = {
     "Кельтский крест": {"price": 50, "cards": 10},
 }
 
-# Хранилище данных пользователей
-users = {}
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    users[user_id] = {
-        "balance": 0,
-        "registered": False,
-        "name": None,
-        "birth_date": None,
-        "current_spread": None,
-        "selected_cards": [],
-        "deck": [],
-    }
-    
-    await update.message.reply_text(
-        "🔮 Добро пожаловать в Таро-Бота!\n"
-        "Для регистрации введите /register"
-    )
+    try:
+        if not get_user(user_id):
+            with sqlite3.connect('tarot.db') as conn:
+                conn.execute(
+                    "INSERT INTO users (user_id) VALUES (?)", 
+                    (user_id,)
+                )
+        await update.message.reply_text(
+            "🔮 Добро пожаловать!\n"
+            "Для регистрации введите /register"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка в /start: {e}")
+        await update.message.reply_text("⚠️ Ошибка инициализации!")
 
 async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    if users[user_id]["registered"]:
-        await update.message.reply_text("❌ Вы уже зарегистрированы!")
-        return
-    
-    users[user_id]["registered"] = True
-    await update.message.reply_text(
-        "✅ Регистрация успешна!\n"
-        "Введите ваше имя и фамилию:"
-    )
+    try:
+        user = get_user(user_id)
+        if user['registered']:
+            await update.message.reply_text("❌ Вы уже зарегистрированы!")
+            return
+            
+        await update.message.reply_text("📝 Введите ваше имя и фамилию:")
+        update_user(user_id, registered=1)
+        
+    except Exception as e:
+        logger.error(f"Ошибка регистрации: {e}")
+        await update.message.reply_text("⚠️ Ошибка регистрации!")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    text = update.message.text
-    
-    if not users[user_id]["registered"]:
-        await update.message.reply_text("⚠️ Сначала зарегистрируйтесь через /register")
-        return
-    
-    if not users[user_id]["name"]:
-        users[user_id]["name"] = text
-        await update.message.reply_text("📅 Введите дату рождения (ДД.ММ.ГГГГ):")
-    elif not users[user_id]["birth_date"]:
-        users[user_id]["birth_date"] = text
-        users[user_id]["balance"] = 100  # Стартовый баланс
-        await update.message.reply_text(
-            f"🎉 Привет, {users[user_id]['name']}!\n"
-            f"Ваш баланс: {users[user_id]['balance']}💰\n"
-            "Используйте /tarot для начала работы"
-        )
+    try:
+        text = update.message.text
+        user = get_user(user_id)
+        
+        if not user['name']:
+            update_user(user_id, name=text)
+            await update.message.reply_text("📅 Введите дату рождения (ДД.ММ.ГГГГ):")
+        elif not user['birth_date']:
+            update_user(user_id, birth_date=text, balance=100)
+            await update.message.reply_text(
+                f"🎉 Регистрация завершена!\n"
+                f"Баланс: 100💰\n"
+                f"Используйте /tarot для расклада"
+            )
+    except Exception as e:
+        logger.error(f"Ошибка обработки текста: {e}")
 
-async def tarot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if not users.get(user_id, {}).get("registered"):
-        await update.message.reply_text("⚠️ Сначала зарегистрируйтесь через /register")
-        return
-    
-    keyboard = [
-        [InlineKeyboardButton(spread, callback_data=f"spread_{spread}")]
-        for spread in SPREADS
-    ]
-    await update.message.reply_text(
-        "🔮 Выберите расклад:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def spread_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    spread_name = query.data.split("_")[1]
-    
-    if users[user_id]["balance"] < SPREADS[spread_name]["price"]:
-        await query.edit_message_text("❌ Недостаточно средств! Пополните баланс.")
-        return
-    
-    users[user_id]["current_spread"] = spread_name
-    users[user_id]["balance"] -= SPREADS[spread_name]["price"]
-    users[user_id]["deck"] = random.sample(tarot_deck, len(tarot_deck))
-    users[user_id]["selected_cards"] = []
-    
-    await show_card_selection(query, user_id)
-
-async def show_card_selection(query, user_id):
-    current_card = len(users[user_id]["selected_cards"]) + 1
-    total_cards = SPREADS[users[user_id]["current_spread"]]["cards"]
-    
-    keyboard = [
-        [InlineKeyboardButton(card["name"], callback_data=f"card_{idx}")]
-        for idx, card in enumerate(users[user_id]["deck"][:10])
-    ]
-    
-    await query.edit_message_text(
-        text=f"🃏 Выбор карты {current_card}/{total_cards}:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def card_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    card_idx = int(query.data.split("_")[1])
-    
-    users[user_id]["selected_cards"].append(users[user_id]["deck"][card_idx])
-    total_needed = SPREADS[users[user_id]["current_spread"]]["cards"]
-    
-    if len(users[user_id]["selected_cards"]) < total_needed:
-        await show_card_selection(query, user_id)
-    else:
-        result = "\n\n".join(
-            f"{i+1}. {card['name']}: {card['meaning']}"
-            for i, card in enumerate(users[user_id]["selected_cards"])
-        )
-        await query.edit_message_text(
-            f"📜 {users[user_id]['name']}, ваш расклад:\n\n{result}\n"
-            f"Остаток баланса: {users[user_id]['balance']}💰"
-        )
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Ошибка: {context.error}")
+    if update.effective_message:
+        await update.effective_message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
 
 def main():
     application = Application.builder().token(TOKEN).build()
     
-    # Регистрация обработчиков
+    # Обработчики
     handlers = [
         CommandHandler("start", start),
         CommandHandler("register", register),
-        CommandHandler("tarot", tarot_handler),
-        CallbackQueryHandler(spread_callback, pattern="^spread_"),
-        CallbackQueryHandler(card_callback, pattern="^card_"),
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text),
     ]
     
     for handler in handlers:
         application.add_handler(handler)
     
-    # Настройка временной зоны
-    application.job_queue.scheduler.configure(timezone=timezone(TIMEZONE))
+    # Обработчик ошибок
+    application.add_error_handler(error_handler)
+    
+    # Настройка времени
+    tz = timezone(TIMEZONE)
+    if application.job_queue:
+        application.job_queue.scheduler.configure(timezone=tz)
     
     application.run_polling()
 
